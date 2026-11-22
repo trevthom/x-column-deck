@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         X Column Deck — multi-user reader
 // @namespace    https://local/x-column-deck
-// @version      1.7.0
-// @description  TweetDeck-style columns of selected X users' posts & replies, grouped into your own lists (separate from X's lists) and filtered from a collapsible sidebar. Inline media + quoted posts, newest on top, capped at 20, click to open the thread, drag to reorder columns. Rides your logged-in session. CSP-safe sandbox build.
+// @version      1.8.0
+// @description  TweetDeck-style columns of selected X users' posts & replies, grouped into your own lists (separate from X's lists) and filtered from a collapsible sidebar. Hide any post to a one-line "Post Hidden" row. Inline media + quoted posts, newest on top, capped at 20, click to open the thread, drag to reorder columns. Rides your logged-in session. CSP-safe sandbox build.
 // @author       you
 // @match        https://x.com/*
 // @match        https://twitter.com/*
@@ -37,13 +37,16 @@
    *   loaded client bundle, so the deck comes up without a profile visit.
    *   v1.7 lets the list sidebar collapse to a thin rail (the choice is
    *   remembered in prefs), so the columns can use the full width.
+   *   v1.8 adds per-post hiding: "hide" on a post folds it into a one-line
+   *   "Post Hidden" row with an unhide link, and each column has a
+   *   "Temporarily unhide all" checkbox for the current session.
    * ========================================================================= */
 
   // The real page window (sandbox shares the same `document`, but globals like
   // fetch / XMLHttpRequest live on the page window -> unsafeWindow).
   const W = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
 
-  console.log('[X Column Deck] v1.7 loaded on', location.host);
+  console.log('[X Column Deck] v1.8 loaded on', location.host);
 
   // ---- storage (GM with localStorage fallback) -----------------------------
   const GM_OK = (typeof GM_setValue === 'function' && typeof GM_getValue === 'function');
@@ -60,6 +63,7 @@
   const LS = {
     users: 'xdeck_users', cap: 'xdeck_captured', cache: 'xdeck_cache', prefs: 'xdeck_prefs',
     profiles: 'xdeck_profiles', lists: 'xdeck_lists', assign: 'xdeck_assign',
+    hidden: 'xdeck_hidden',
   };
 
   let users    = store.get(LS.users, []);
@@ -72,6 +76,11 @@
   let lists  = store.get(LS.lists, []);  // [{ id, name }]
   let assign = store.get(LS.assign, {}); // handle -> list id ('' / missing = unsorted)
   const UNSORTED = '__none__';
+
+  // Posts you hid, by tweet id — persisted so they stay hidden on reload.
+  const hiddenSet = new Set([].concat(store.get(LS.hidden, []) || []));
+  // Session-only: columns where "temporarily unhide all" is ticked.
+  const tempReveal = {};
   prefs.activeLists = Array.isArray(prefs.activeLists) ? prefs.activeLists : [];
   if (typeof prefs.addList !== 'string') prefs.addList = '';
   prefs.sideCollapsed = !!prefs.sideCollapsed;
@@ -594,6 +603,15 @@
     .xdeck-colhead select{background:#16181c;border:1px solid #333639;color:#8b98a5;border-radius:6px;font-size:10px;padding:2px 3px;max-width:96px;margin-left:auto;cursor:pointer}
     .xdeck-colhead .x{color:#8b98a5;cursor:pointer;border:none;background:none;font-size:16px;padding:2px 6px;flex:0 0 auto}
     .xdeck-colhead .x:hover{color:#f4212e}
+    .xdeck-colbar{display:flex;align-items:center;gap:8px;padding:5px 11px;border-bottom:1px solid #2f3336;background:#0d0f11;flex:0 0 auto}
+    .xdeck-colbar .xdeck-toggle{font-size:11px;gap:4px;color:#8b98a5;cursor:pointer}
+    .xdeck-colbar input{margin:0;accent-color:#1d9bf0;cursor:pointer}
+    .xdeck-hidelink{background:none;border:none;padding:0;margin:0;font:inherit;font-size:11px;color:#1d9bf0;cursor:pointer}
+    .xdeck-hidelink:hover{text-decoration:underline}
+    .xdeck-post .meta .xdeck-hidelink{margin-left:auto;font-size:11px}
+    .xdeck-post.xdeck-hidrow{cursor:default;display:flex;align-items:center;gap:8px;padding:9px 12px;background:none}
+    .xdeck-post.xdeck-hidrow:hover{background:#0f1113}
+    .xdeck-hidrow .lbl{flex:1 1 auto;font-size:12px;color:#8b98a5}
     .xdeck-body{flex:1 1 auto;overflow-y:auto;overflow-x:hidden}
     .xdeck-post{padding:11px 12px;border-bottom:1px solid #1c1f22;cursor:pointer}
     .xdeck-post:hover{background:#0f1113}
@@ -869,19 +887,57 @@
       `</div>`;
   }
 
+  function saveHidden() { store.set(LS.hidden, [...hiddenSet]); }
+
+  // Swap a single card in place, so hiding never jumps the column's scroll.
+  function replaceCard(p, handle) {
+    const card = overlay?.querySelector(`.xdeck-col[data-handle="${handle}"] .xdeck-post[data-id="${p.id}"]`);
+    if (card) card.replaceWith(makePostCard(p, handle));
+    else renderColumns();
+  }
+
+  function hidePost(p, handle) {
+    hiddenSet.add(p.id); saveHidden(); replaceCard(p, handle);
+  }
+
+  function unhidePost(p, handle) {
+    hiddenSet.delete(p.id); saveHidden(); replaceCard(p, handle);
+  }
+
+  // A hidden post keeps its place in the column as one line: label + unhide link.
+  function makeHiddenRow(p, handle) {
+    const row = document.createElement('div');
+    row.className = 'xdeck-post xdeck-hidrow';
+    row.dataset.id = p.id;
+    row.innerHTML = `<span class="lbl">Post Hidden</span>` +
+      `<button class="xdeck-hidelink" data-act="unhide" title="show this post again">unhide</button>`;
+    row.querySelector('[data-act]').onclick = (e) => { e.stopPropagation(); unhidePost(p, handle); };
+    return row;
+  }
+
   function makePostCard(p, handle) {
+    const isHidden = hiddenSet.has(p.id);
+    if (isHidden && !tempReveal[handle]) return makeHiddenRow(p, handle);
+
     const card = document.createElement('div');
     card.className = 'xdeck-post';
+    card.dataset.id = p.id;
     const tag = p.kind === 'retweet' ? `<span class="xdeck-tag rt">🔁 RT</span>`
       : p.kind === 'reply' ? `<span class="xdeck-tag reply">↩ reply${p.replyTo ? ' @' + esc(p.replyTo) : ''}</span>` : '';
     const t = bodyText(p);
     card.innerHTML =
-      `<div class="meta"><span class="nm">${esc(p.name || handle)}</span><span>· ${relTime(p.created)}</span>${tag}</div>` +
+      `<div class="meta"><span class="nm">${esc(p.name || handle)}</span><span>· ${relTime(p.created)}</span>${tag}` +
+      `<button class="xdeck-hidelink" data-act="${isHidden ? 'unhide' : 'hide'}" title="${isHidden ? 'show this post again' : 'collapse this post to one line'}">${isHidden ? 'unhide' : 'hide'}</button></div>` +
       (t ? `<div class="txt">${t}</div>` : '') +
       mediaHtml(p.media) +
       quotedHtml(p.quoted) +
       cardHtml(p.card);
+    card.querySelector('[data-act]').onclick = (e) => {
+      e.stopPropagation();
+      if (hiddenSet.has(p.id)) unhidePost(p, handle); else hidePost(p, handle);
+    };
     card.onclick = (e) => {
+      if (e.target.closest('[data-act]')) { e.stopPropagation(); return; }
       if (e.target.closest('a')) { e.stopPropagation(); return; }   // readable link: let it open itself
       if (e.target.closest('video')) return;                        // let video controls work
       const cd = e.target.closest('.xdeck-card');                   // link-preview card -> its destination
@@ -907,6 +963,7 @@
       if (fresh.length) {
         view[handle] = [...(view[handle] || []), ...fresh];
         for (const p of applyFilters(fresh)) body.insertBefore(makePostCard(p, handle), footer);
+        if (footer) footer.textContent = ended.has(handle) ? '— end of timeline —' : '';
       }
     } catch (e) {
       console.warn('[X Column Deck] load more failed for', handle, e);
@@ -914,6 +971,21 @@
       loadingMore.delete(handle);
       if (footer) footer.textContent = ended.has(handle) ? '— end of timeline —' : '';
     }
+  }
+
+  // (Re)draw one column's posts. Used on first build and by "temporarily unhide all".
+  function paintBody(body, handle) {
+    body.innerHTML = '';
+    const posts = applyFilters(view[handle] || []);
+    if (!posts.length) {
+      body.innerHTML = `<div class="xdeck-empty">${isReady() ? 'No posts cached yet — hit Refresh all.' : 'Still initializing — press “initialize” in the header, then Refresh all.'}</div>`;
+      return;
+    }
+    for (const p of posts) body.appendChild(makePostCard(p, handle));
+    const footer = document.createElement('div');
+    footer.className = 'xdeck-foot';
+    footer.textContent = ended.has(handle) ? '— end of timeline —' : '';
+    body.appendChild(footer);
   }
 
   function listOptions(handle) {
@@ -928,7 +1000,6 @@
     col.dataset.handle = handle;
 
     if (!view[handle]) view[handle] = [...(cache[handle] || [])]; // seed from persisted page
-    const posts = applyFilters(view[handle]);
     const prof = profiles[handle] || {};
     const avatar = (prof.avatar || '').replace('_normal', '_bigger');
     const name = prof.name || ('@' + handle);
@@ -944,21 +1015,23 @@
         <select class="xdeck-listpick" data-handle="${esc(handle)}" title="put this column in a list">${listOptions(handle)}</select>
         <button class="x" title="remove">✕</button>
       </div>
+      <div class="xdeck-colbar">
+        <label class="xdeck-toggle"><input type="checkbox" class="xdeck-reveal"> Temporarily unhide all</label>
+      </div>
       <div class="xdeck-body"></div>`;
 
     const body = col.querySelector('.xdeck-body');
-    if (!posts.length) {
-      body.innerHTML = `<div class="xdeck-empty">${isReady() ? 'No posts cached yet — hit Refresh all.' : 'Still initializing — press “initialize” in the header, then Refresh all.'}</div>`;
-    } else {
-      for (const p of posts) body.appendChild(makePostCard(p, handle));
-      const footer = document.createElement('div');
-      footer.className = 'xdeck-foot';
-      footer.textContent = ended.has(handle) ? '— end of timeline —' : '';
-      body.appendChild(footer);
-      body.addEventListener('scroll', () => {
-        if (body.scrollTop + body.clientHeight >= body.scrollHeight - 250) loadMore(handle, body, footer);
-      });
-    }
+    paintBody(body, handle);
+    body.addEventListener('scroll', () => {
+      if (body.scrollTop + body.clientHeight >= body.scrollHeight - 250) {
+        loadMore(handle, body, body.querySelector('.xdeck-foot'));
+      }
+    });
+
+    // session-only reveal toggle for every hidden post in this column
+    const reveal = col.querySelector('.xdeck-reveal');
+    reveal.checked = !!tempReveal[handle];
+    reveal.onchange = () => { tempReveal[handle] = reveal.checked; paintBody(body, handle); };
 
     col.querySelector('.x').onclick = () => {
       users = users.filter((u) => u !== handle); store.set(LS.users, users);

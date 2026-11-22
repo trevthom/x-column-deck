@@ -62,6 +62,13 @@ Notes on the first run and permissions:
 - **Hide the sidebar**: the ‹ button in the sidebar header collapses it to a thin
   rail and gives the columns the full width; › brings it back. The deck remembers
   which state you left it in. The list filter stays applied either way.
+- **Hide a post**: the **hide** link on the right of a post's byline folds it into
+  a single **Post Hidden** line in the same position; **unhide** in that line
+  brings it back. Hiding is remembered, per post, across reloads.
+- **Temporarily unhide all**: the checkbox at the top of each column shows every
+  hidden post in that column again for the current session (they still read
+  **unhide** instead of **hide**). Reloading X or unticking the box hides them
+  again.
 - **Re-file a column**: use the small dropdown in the column header.
 - **Reorder columns**: drag a column by its header. **Remove**: the ✕ in the header.
 - **Refresh**: *Refresh all* reloads the visible columns (X is rate limited, so it
