@@ -24,14 +24,21 @@ This script can be inserted into the Tampermonkey extension to turn your X.com U
 4. Save with **Ctrl/Cmd + S**. The script now appears in the **Installed
    Userscripts** list with its switch turned on (green).
 5. Open <https://x.com> (or <https://twitter.com>) and reload the page once.
-   A **▦ Deck** button appears in the bottom-right corner.
+   A **▦ Deck** button appears in the top-right corner (under X's own header
+   icons).
 
 Notes on the first run and permissions:
 
-- The script has to see X's own requests once so it can learn the current
-  GraphQL IDs from your logged-in session. Visit any profile page, then open the
-  deck: the status in its header changes from *"open any X profile once to
-  initialize"* to **✓ ready**.
+- The script needs the current internal API details before it can load a
+  column. It learns them on its own: it reads the query IDs and session token
+  from the X page you are already on, and also watches X's own requests while
+  you browse. The header status goes from *"initializing…"* to **✓ ready**.
+  This normally takes a second or two after the page loads.
+- If it stays on *initializing*, press **initialize** next to the status. If
+  that still fails, reload x.com once (the script needs the page's own client
+  bundle to be loaded) and press **initialize** again. Any failure is now
+  spelled out in the status area — for example `⚠ HTTP 404 on UserTweets` means
+  X rotated its API and a reload plus **initialize** fixes it.
 - If the **▦ Deck** button doesn't appear, check that the script is enabled for
   `x.com` in Tampermonkey (the icon shows a badge with the number of scripts that
   ran), and that your browser allows userscripts / developer mode (Chrome needs
@@ -56,7 +63,10 @@ Notes on the first run and permissions:
 - **Reorder columns**: drag a column by its header. **Remove**: the ✕ in the header.
 - **Refresh**: *Refresh all* reloads the visible columns (X is rate limited, so it
   pauses between users); *auto* refreshes on a timer while the deck is open.
-  Scrolling to the bottom of a column loads older posts.
+  Scrolling to the bottom of a column loads older posts. If a refresh fails, the
+  header says why; a 400/404 triggers an automatic re-learn of X's API.
+- **Initialize**: the button next to the status re-learns X's API from the page.
+  Use it after X changes something and columns stop updating.
 
 ## Updating
 

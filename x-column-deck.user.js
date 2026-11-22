@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         X Column Deck — multi-user reader
 // @namespace    https://local/x-column-deck
-// @version      1.5.0
+// @version      1.6.0
 // @description  TweetDeck-style columns of selected X users' posts & replies, grouped into your own lists (separate from X's lists) and filtered from a sidebar. Inline media + quoted posts, newest on top, capped at 20, click to open the thread, drag to reorder columns. Rides your logged-in session. CSP-safe sandbox build.
 // @author       you
 // @match        https://x.com/*
@@ -12,6 +12,10 @@
 // @grant        GM_getValue
 // @grant        GM_deleteValue
 // @grant        GM_registerMenuCommand
+// @grant        GM_xmlhttpRequest
+// @connect      abs.twimg.com
+// @connect      x.com
+// @connect      twitter.com
 // ==/UserScript==
 
 (function () {
@@ -26,13 +30,18 @@
    *   once to teach it; after that it can fetch any user's column itself.
    *   v1.5 adds private lists kept by the script itself (not X's lists) plus a
    *   left sidebar to filter columns by those lists.
+   *   v1.6 fixes initialization: X sends some GraphQL calls as POST with the
+   *   variables in the body (the old capture only read the URL, so it never
+   *   learned anything and Refresh did nothing), replays the same method it
+   *   saw, and can also learn the current query IDs straight from X's own
+   *   loaded client bundle, so the deck comes up without a profile visit.
    * ========================================================================= */
 
   // The real page window (sandbox shares the same `document`, but globals like
   // fetch / XMLHttpRequest live on the page window -> unsafeWindow).
   const W = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
 
-  console.log('[X Column Deck] v1.5 loaded on', location.host);
+  console.log('[X Column Deck] v1.6 loaded on', location.host);
 
   // ---- storage (GM with localStorage fallback) -----------------------------
   const GM_OK = (typeof GM_setValue === 'function' && typeof GM_getValue === 'function');
@@ -89,7 +98,7 @@
     if (Object.keys(out).length) captured.headers = { ...captured.headers, ...out };
   }
 
-  function learnFrom(url, hdrs) {
+  function learnFrom(url, hdrs, body, method) {
     try {
       if (!url || url.indexOf('/graphql/') === -1) return;
       const u = new URL(url, location.origin);
@@ -97,20 +106,34 @@
       if (!m) return;
       const [, queryId, opName] = m;
       const apiBase = u.origin + u.pathname.slice(0, u.pathname.indexOf('/graphql/') + '/graphql/'.length);
-      const parseParam = (n) => { try { return JSON.parse(u.searchParams.get(n)); } catch { return null; } };
-      const variables = parseParam('variables');
-      const features = parseParam('features');
-      const fieldToggles = parseParam('fieldToggles');
+      const fromQuery = (n) => { try { return JSON.parse(u.searchParams.get(n)); } catch { return null; } };
+      let variables = fromQuery('variables');
+      let features = fromQuery('features');
+      let fieldToggles = fromQuery('fieldToggles');
+
+      // X also issues some operations as POST with the JSON payload in the body.
+      // Reading only the URL is why older builds never became "ready".
+      if (variables == null && typeof body === 'string' && body) {
+        try {
+          const j = JSON.parse(body);
+          if (j && typeof j === 'object') {
+            if (j.variables != null) variables = j.variables;
+            if (j.features != null) features = j.features;
+            if (j.fieldToggles != null) fieldToggles = j.fieldToggles;
+          }
+        } catch {}
+      }
 
       if (hdrs && Object.keys(hdrs).length) rememberHeaders(hdrs);
       if (apiBase) captured.apiBase = apiBase;
 
+      const verb = String(method || 'GET').toUpperCase();
       if (opName === 'UserByScreenName' && variables) {
-        captured.byScreenName = { queryId, opName, variables, features, fieldToggles };
+        captured.byScreenName = { queryId, opName, variables, features, fieldToggles, method: verb };
         store.set(LS.cap, captured); markReady();
       } else if ((opName === 'UserTweetsAndReplies' || opName === 'UserTweets') && variables) {
         if (opName === 'UserTweetsAndReplies' || !captured.userTweets) {
-          captured.userTweets = { queryId, opName, variables, features, fieldToggles };
+          captured.userTweets = { queryId, opName, variables, features, fieldToggles, method: verb };
           store.set(LS.cap, captured); markReady();
         }
       }
@@ -124,7 +147,7 @@
       const url = typeof input === 'string' ? input : (input && input.url) || '';
       let hdrs = headersToObj(init && init.headers);
       if (!Object.keys(hdrs).length && input && input.headers) hdrs = headersToObj(input.headers);
-      learnFrom(url, hdrs);
+      learnFrom(url, hdrs, (init && typeof init.body === 'string') ? init.body : '', (init && init.method) || (input && input.method) || 'GET');
     } catch {}
     return origFetch.apply(this, arguments);
   };
@@ -132,9 +155,9 @@
   try {
     const XP = W.XMLHttpRequest.prototype;
     const xOpen = XP.open, xSet = XP.setRequestHeader, xSend = XP.send;
-    XP.open = function (m, url) { this.__xd_url = url; this.__xd_h = {}; return xOpen.apply(this, arguments); };
+    XP.open = function (m, url) { this.__xd_url = url; this.__xd_m = m; this.__xd_h = {}; return xOpen.apply(this, arguments); };
     XP.setRequestHeader = function (k, v) { try { (this.__xd_h ||= {})[k] = v; } catch {} return xSet.apply(this, arguments); };
-    XP.send = function () { try { learnFrom(this.__xd_url, this.__xd_h); } catch {} return xSend.apply(this, arguments); };
+    XP.send = function (body) { try { learnFrom(this.__xd_url, this.__xd_h, typeof body === 'string' ? body : '', this.__xd_m); } catch {} return xSend.apply(this, arguments); };
   } catch {}
 
   // ---- helpers -------------------------------------------------------------
@@ -155,16 +178,147 @@
 
   // ---- GraphQL calls (using your learned session) --------------------------
   async function gql(op, overrideVars) {
+    if (!op || !op.queryId) throw new Error('not initialized');
     const variables = { ...(op.variables || {}), ...overrideVars };
-    const qs = new URLSearchParams();
-    qs.set('variables', JSON.stringify(variables));
-    if (op.features) qs.set('features', JSON.stringify(op.features));
-    if (op.fieldToggles) qs.set('fieldToggles', JSON.stringify(op.fieldToggles));
-    const url = captured.apiBase + op.queryId + '/' + op.opName + '?' + qs.toString();
+    const method = String(op.method || 'GET').toUpperCase();
+    const base = captured.apiBase + op.queryId + '/' + op.opName;
     const headers = { ...captured.headers, 'x-csrf-token': getCookie('ct0') };
-    const res = await origFetch.call(W, url, { method: 'GET', headers, credentials: 'include' });
-    if (!res.ok) throw new Error('HTTP ' + res.status);
+    let url = base;
+    let init = { method, headers, credentials: 'include' };
+
+    if (method === 'POST') {
+      // Replay the same shape we saw X use: JSON body instead of a query string.
+      headers['content-type'] = 'application/json';
+      const payload = { variables };
+      if (op.features) payload.features = op.features;
+      if (op.fieldToggles) payload.fieldToggles = op.fieldToggles;
+      init = { ...init, headers, body: JSON.stringify(payload) };
+    } else {
+      const qs = new URLSearchParams();
+      qs.set('variables', JSON.stringify(variables));
+      if (op.features) qs.set('features', JSON.stringify(op.features));
+      if (op.fieldToggles) qs.set('fieldToggles', JSON.stringify(op.fieldToggles));
+      url = base + '?' + qs.toString();
+    }
+
+    const res = await origFetch.call(W, url, init);
+    if (!res.ok) {
+      const err = new Error('HTTP ' + res.status + ' on ' + op.opName);
+      err.status = res.status;
+      throw err;
+    }
     return res.json();
+  }
+
+  // ---- bootstrapping X's API without waiting for a profile visit -----------
+  // Query IDs rotate with every X deploy, but the ones this page is already
+  // using live in its own client bundle. Scanning that bundle means the deck
+  // can come up on its own instead of sitting on "open a profile once" forever.
+  const PUBLIC_BEARER = 'AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA';
+  const BOOT_OPS = ['UserByScreenName', 'UserTweets', 'UserTweetsAndReplies'];
+  const QID_RE = /queryId\s*:\s*"([\w-]{10,40})"\s*,\s*operationName\s*:\s*"(\w+)"/g;
+  const QID_RE_REV = /operationName\s*:\s*"(\w+)"\s*,\s*queryId\s*:\s*"([\w-]{10,40})"/g;
+  let booting = null;
+
+  function gmText(url) {
+    return new Promise((resolve, reject) => {
+      if (typeof GM_xmlhttpRequest !== 'function') return reject(new Error('unavailable'));
+      try {
+        GM_xmlhttpRequest({
+          method: 'GET', url, timeout: 25000,
+          onload: (r) => (r.status >= 200 && r.status < 300 ? resolve(r.responseText) : reject(new Error('HTTP ' + r.status))),
+          onerror: () => reject(new Error('network error')),
+          ontimeout: () => reject(new Error('timeout')),
+        });
+      } catch (e) { reject(e); }
+    });
+  }
+  async function textFrom(url) {
+    try { return await gmText(url); } catch {}
+    const res = await origFetch.call(W, url, { credentials: 'omit' });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    return res.text();
+  }
+
+  // The client bundles this page has already loaded.
+  function clientBundleUrls() {
+    const out = [];
+    for (const s of document.querySelectorAll('script[src]')) {
+      try {
+        const u = new URL(s.src, location.href);
+        if (!/\.js$/.test(u.pathname)) continue;
+        if (!/(abs\.)?twimg\.com$|(^|\.)(x|twitter)\.com$/.test(u.hostname)) continue;
+        if (!/client-web|responsive-web|x-web/.test(u.href)) continue;
+        if (!out.includes(u.href)) out.push(u.href);
+      } catch {}
+    }
+    return out;
+  }
+
+  // Learn from what the page itself loaded. force=true replaces IDs learned
+  // earlier, which is what to do when X has rotated them (400/404 answers).
+  async function bootstrap(opts = {}) {
+    const { manual = false, force = false } = opts;
+    if (booting) return booting;
+    booting = (async () => {
+      if (!captured.headers || typeof captured.headers !== 'object') captured.headers = {};
+      const urls = clientBundleUrls();
+      const found = {};
+      let bearer = '';
+      for (const url of urls) {
+        let txt;
+        try { txt = await textFrom(url); } catch { continue; }
+        if (!txt) continue;
+        if (!bearer) { const b = txt.match(/AAAAAAAAAAAAAAAAAAAAA[\w%+.-]{35,}/); if (b) bearer = b[0]; }
+        let m;
+        QID_RE.lastIndex = 0;
+        while ((m = QID_RE.exec(txt))) if (BOOT_OPS.includes(m[2]) && !found[m[2]]) found[m[2]] = m[1];
+        QID_RE_REV.lastIndex = 0;
+        while ((m = QID_RE_REV.exec(txt))) if (BOOT_OPS.includes(m[1]) && !found[m[1]]) found[m[1]] = m[2];
+        if (bearer && found.UserByScreenName && (found.UserTweets || found.UserTweetsAndReplies)) break;
+      }
+
+      const twOp = found.UserTweets || found.UserTweetsAndReplies;
+      if (bearer || found.UserByScreenName || twOp) {
+        if (!captured.apiBase) captured.apiBase = location.origin + '/i/api/graphql/';
+        if (!captured.headers.authorization) captured.headers.authorization = 'Bearer ' + (bearer || PUBLIC_BEARER);
+        // When we already learned an op from real traffic, only refresh its
+        // rotated ID/name: its variables and feature flags are known-good.
+        if (found.UserByScreenName && (force || !captured.byScreenName)) {
+          const prev = captured.byScreenName || {};
+          captured.byScreenName = {
+            ...prev,
+            queryId: found.UserByScreenName, opName: 'UserByScreenName',
+            variables: prev.variables || { withSafetyModeUserFields: true },
+            features: prev.features || {},
+            fieldToggles: prev.fieldToggles ?? null,
+            method: prev.method || 'GET',
+          };
+        }
+        if (twOp && (force || !captured.userTweets)) {
+          const prev = captured.userTweets || {};
+          captured.userTweets = {
+            ...prev,
+            queryId: twOp, opName: 'UserTweets',
+            variables: prev.variables || { count: 20, includePromotedContent: false, withQuickPromoteEligibilityTweetFields: false, withVoice: false },
+            features: prev.features || {},
+            fieldToggles: prev.fieldToggles ?? { withArticlePlainText: false },
+            method: prev.method || 'GET',
+          };
+        }
+        store.set(LS.cap, captured);
+      }
+
+      const ok = isReady();
+      if (manual) {
+        if (ok) updateStatus();
+        else if (!urls.length) updateStatus("⚠ couldn't find X's scripts — reload x.com once", true);
+        else updateStatus('⚠ could not learn the API — reload x.com, then press initialize', true);
+      }
+      markReady();
+      return ok;
+    })();
+    try { return await booting; } finally { booting = null; }
   }
 
   async function lookupUser(handle) {
@@ -386,7 +540,7 @@
   function injectStyles() {
     if (document.getElementById('xdeck-style')) return;
     const css = `
-    #xdeck-fab{position:fixed;right:18px;bottom:18px;z-index:2147483646;background:#1d9bf0;color:#fff;border:none;border-radius:999px;padding:11px 16px;font:600 14px system-ui;cursor:pointer;box-shadow:0 4px 14px rgba(0,0,0,.4)}
+    #xdeck-fab{position:fixed;right:18px;top:64px;z-index:2147483646;background:#1d9bf0;color:#fff;border:none;border-radius:999px;padding:11px 16px;font:600 14px system-ui;cursor:pointer;box-shadow:0 4px 14px rgba(0,0,0,.4)}
     #xdeck-fab:hover{background:#1a8cd8}
     #xdeck-overlay{position:fixed;inset:0;z-index:2147483647;background:#000;color:#e7e9ea;display:none;flex-direction:column;font:14px/1.4 system-ui,-apple-system,"Segoe UI",sans-serif}
     #xdeck-overlay.open{display:flex}
@@ -490,6 +644,7 @@
           </select>
         </label>
         <span id="xdeck-status"></span>
+        <button class="xdeck-btn small" id="xdeck-init" title="re-learn X's API from this page">initialize</button>
         <button class="xdeck-btn" id="xdeck-close" style="margin-left:8px">✕ close</button>
       </div>
       <div id="xdeck-main">
@@ -530,6 +685,10 @@
     $('#xdeck-add').addEventListener('keydown', (e) => { if (e.key === 'Enter') addNow(); });
     $('#xdeck-addlist').addEventListener('change', (e) => { prefs.addList = e.target.value; savePrefs(); });
     $('#xdeck-refresh').onclick = () => refreshAll();
+    $('#xdeck-init').onclick = async () => {
+      updateStatus("⏳ learning X's API…", true);
+      if (!(await bootstrap({ manual: true, force: true }))) updateStatus('⚠ still not ready — reload x.com, then press initialize', true);
+    };
     $('#xdeck-close').onclick = () => closeDeck();
     $('#xdeck-rep').onchange = (e) => { prefs.showReplies = e.target.checked; savePrefs(); renderColumns(); };
     $('#xdeck-rt').onchange = (e) => { prefs.showRetweets = e.target.checked; savePrefs(); renderColumns(); };
@@ -577,11 +736,22 @@
     renderColumns();
   }
 
-  function updateStatus() {
+  function missingParts() {
+    const miss = [];
+    if (!captured.apiBase) miss.push('api base');
+    if (!(captured.headers && captured.headers.authorization)) miss.push('session token');
+    if (!captured.byScreenName) miss.push('profile lookup');
+    if (!captured.userTweets) miss.push('timeline');
+    return miss;
+  }
+
+  // msg=null shows the normal ready / initializing text.
+  function updateStatus(msg, warn) {
     const el = overlay?.querySelector('#xdeck-status');
     if (!el) return;
+    if (msg) { el.textContent = msg; el.classList.toggle('warn', !!warn); return; }
     if (isReady()) { el.textContent = '✓ ready'; el.classList.remove('warn'); }
-    else { el.textContent = '⏳ open any X profile once to initialize'; el.classList.add('warn'); }
+    else { el.textContent = '⏳ initializing… (' + missingParts().join(', ') + ')'; el.classList.add('warn'); }
   }
 
   // ---- sidebar: the deck's lists + which ones are showing -------------------
@@ -748,7 +918,7 @@
 
     const body = col.querySelector('.xdeck-body');
     if (!posts.length) {
-      body.innerHTML = `<div class="xdeck-empty">${isReady() ? 'No posts cached yet — hit Refresh all.' : 'Open any X profile once to initialize, then Refresh.'}</div>`;
+      body.innerHTML = `<div class="xdeck-empty">${isReady() ? 'No posts cached yet — hit Refresh all.' : 'Still initializing — press “initialize” in the header, then Refresh all.'}</div>`;
     } else {
       for (const p of posts) body.appendChild(makePostCard(p, handle));
       const footer = document.createElement('div');
@@ -786,8 +956,12 @@
   }
 
   // ---- refresh -------------------------------------------------------------
-  async function refreshOne(handle) {
-    if (!isReady()) { updateStatus(); return; }
+  async function refreshOne(handle, canRelearn = true) {
+    if (!isReady()) {
+      updateStatus('⏳ initializing…', true);
+      await bootstrap();
+      if (!isReady()) { renderColumns(); return; }
+    }
     const col = overlay?.querySelector(`.xdeck-col[data-handle="${handle}"]`);
     col?.classList.add('loading');
     try {
@@ -795,8 +969,15 @@
       cache[handle] = posts.slice(0, PAGE); store.set(LS.cache, cache); // persist the most-recent page
       view[handle] = [...posts];                                        // fresh view starts here
       cursors[handle] = cursor; ended.delete(handle);                   // reset pagination
-    } catch (e) { console.warn('[X Column Deck] refresh failed for', handle, e); }
-    finally { renderColumns(); }
+      updateStatus();
+    } catch (e) {
+      console.warn('[X Column Deck] refresh failed for', handle, e);
+      // A rotated query ID or stale token comes back as 400/404 — relearn and retry once.
+      if (canRelearn && (e.status === 400 || e.status === 404 || !e.status)) {
+        if (await bootstrap({ manual: true, force: true })) return refreshOne(handle, false);
+      }
+      updateStatus('⚠ ' + (e.message || e) + ' — press initialize', true);
+    } finally { renderColumns(); }
   }
 
   async function refreshAll() {
@@ -812,7 +993,15 @@
   }
 
   // ---- boot ----------------------------------------------------------------
-  function markReady() { if (overlay) updateStatus(); }
+  let lastReady = null;
+  function markReady() {
+    const ready = isReady();
+    if (overlay) updateStatus();
+    if (ready !== lastReady) {
+      lastReady = ready;
+      if (ready && isOpen()) renderColumns(); // drop the "initializing" placeholders
+    }
+  }
 
   // Opening the deck. The overlay is rebuilt whenever X has thrown it away, so
   // the launcher button can never end up toggling a detached copy of the deck
@@ -827,6 +1016,7 @@
     ensureOverlay();
     overlay.classList.add('open');
     updateStatus(); renderSidebar(); renderColumns(); scheduleAuto();
+    if (!isReady()) bootstrap();
   }
   function closeDeck() { if (overlay) overlay.classList.remove('open'); }
   function toggleDeck() { if (!document.body) return; isOpen() ? closeDeck() : openDeck(); }
@@ -846,7 +1036,11 @@
   }
 
   // Add the button now and keep it alive across X's SPA re-renders.
-  function boot() { if (document.body) addFab(); }
+  function boot() {
+    if (!document.body) return;
+    addFab();
+    if (!isReady()) setTimeout(() => { bootstrap(); }, 1200);
+  }
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
   else boot();
   setInterval(() => {
