@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         X Column Deck — multi-user reader
 // @namespace    https://local/x-column-deck
-// @version      1.4.0
-// @description  TweetDeck-style columns of selected X users' posts & replies. Inline media + quoted posts, newest on top, capped at 20, click to open the thread, drag to reorder columns. Rides your logged-in session. CSP-safe sandbox build.
+// @version      1.5.0
+// @description  TweetDeck-style columns of selected X users' posts & replies, grouped into your own lists (separate from X's lists) and filtered from a sidebar. Inline media + quoted posts, newest on top, capped at 20, click to open the thread, drag to reorder columns. Rides your logged-in session. CSP-safe sandbox build.
 // @author       you
 // @match        https://x.com/*
 // @match        https://twitter.com/*
@@ -11,25 +11,28 @@
 // @grant        GM_setValue
 // @grant        GM_getValue
 // @grant        GM_deleteValue
+// @grant        GM_registerMenuCommand
 // ==/UserScript==
 
 (function () {
   'use strict';
 
   /* =========================================================================
-   * X Column Deck v1.1
+   * X Column Deck v1.5
    *   v1.1 runs in the userscript-manager SANDBOX (because of the @grant lines
    *   above) so X's Content Security Policy can't block it, then reaches into
    *   the real page via `unsafeWindow` to watch network traffic and learn X's
    *   current GraphQL format from YOUR logged-in session. Visit any profile
    *   once to teach it; after that it can fetch any user's column itself.
+   *   v1.5 adds private lists kept by the script itself (not X's lists) plus a
+   *   left sidebar to filter columns by those lists.
    * ========================================================================= */
 
   // The real page window (sandbox shares the same `document`, but globals like
   // fetch / XMLHttpRequest live on the page window -> unsafeWindow).
   const W = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
 
-  console.log('[X Column Deck] v1.4 loaded on', location.host);
+  console.log('[X Column Deck] v1.5 loaded on', location.host);
 
   // ---- storage (GM with localStorage fallback) -----------------------------
   const GM_OK = (typeof GM_setValue === 'function' && typeof GM_getValue === 'function');
@@ -43,13 +46,23 @@
       try { localStorage.setItem(k, JSON.stringify(v)); } catch {}
     },
   };
-  const LS = { users: 'xdeck_users', cap: 'xdeck_captured', cache: 'xdeck_cache', prefs: 'xdeck_prefs', profiles: 'xdeck_profiles' };
+  const LS = {
+    users: 'xdeck_users', cap: 'xdeck_captured', cache: 'xdeck_cache', prefs: 'xdeck_prefs',
+    profiles: 'xdeck_profiles', lists: 'xdeck_lists', assign: 'xdeck_assign',
+  };
 
   let users    = store.get(LS.users, []);
   let captured = store.get(LS.cap, { apiBase: '', headers: {}, byScreenName: null, userTweets: null });
   let cache    = store.get(LS.cache, {});
-  let prefs    = store.get(LS.prefs, { showReplies: true, showRetweets: true, autoMin: 0 });
+  let prefs    = store.get(LS.prefs, { showReplies: true, showRetweets: true, autoMin: 0, activeLists: [], addList: '' });
   let profiles = store.get(LS.profiles, {}); // handle -> { id, name, screen, avatar }
+
+  // The deck's OWN lists. Not X.com lists — these never touch your account.
+  let lists  = store.get(LS.lists, []);  // [{ id, name }]
+  let assign = store.get(LS.assign, {}); // handle -> list id ('' / missing = unsorted)
+  const UNSORTED = '__none__';
+  prefs.activeLists = Array.isArray(prefs.activeLists) ? prefs.activeLists : [];
+  if (typeof prefs.addList !== 'string') prefs.addList = '';
 
   // session-only pagination state (cache persists just the most-recent page)
   const cursors = {};       // handle -> bottom cursor for the next page
@@ -330,6 +343,45 @@
     });
   }
 
+  // ---- the deck's own lists ------------------------------------------------
+  function saveLists() { store.set(LS.lists, lists); }
+  function saveAssign() { store.set(LS.assign, assign); }
+  function savePrefs() { store.set(LS.prefs, prefs); }
+
+  function createList(name) {
+    const clean = (name || '').trim().slice(0, 40);
+    if (!clean) return null;
+    if (lists.some((l) => l.name.toLowerCase() === clean.toLowerCase())) return lists.find((l) => l.name.toLowerCase() === clean.toLowerCase());
+    const id = 'l' + Date.now().toString(36) + Math.random().toString(36).slice(2, 5);
+    lists.push({ id, name: clean });
+    saveLists();
+    return id;
+  }
+
+  function deleteList(id) {
+    lists = lists.filter((l) => l.id !== id);
+    for (const h of Object.keys(assign)) if (assign[h] === id) delete assign[h];
+    prefs.activeLists = prefs.activeLists.filter((x) => x !== id);
+    if (prefs.addList === id) prefs.addList = '';
+    saveLists(); saveAssign(); savePrefs();
+  }
+
+  function setUserList(handle, id) {
+    if (id) assign[handle] = id; else delete assign[handle];
+    saveAssign();
+  }
+
+  // Handles whose columns should currently be on screen.
+  function visibleHandles() {
+    const chosen = prefs.activeLists.filter((id) => id === UNSORTED || lists.some((l) => l.id === id));
+    if (!chosen.length) return [...users];            // nothing ticked -> show every list
+    return users.filter((h) => {
+      const lid = assign[h] || '';
+      if (!lid) return chosen.includes(UNSORTED);
+      return chosen.includes(lid);
+    });
+  }
+
   // ---- UI ------------------------------------------------------------------
   function injectStyles() {
     if (document.getElementById('xdeck-style')) return;
@@ -341,12 +393,29 @@
     #xdeck-bar{display:flex;align-items:center;gap:8px;padding:10px 12px;border-bottom:1px solid #2f3336;flex:0 0 auto;flex-wrap:wrap}
     #xdeck-bar h1{font-size:15px;margin:0 8px 0 2px;font-weight:800}
     #xdeck-bar input[type=text]{background:#16181c;border:1px solid #333639;color:#e7e9ea;border-radius:8px;padding:7px 10px;font-size:13px;width:170px}
+    #xdeck-bar select{background:#16181c;border:1px solid #333639;color:#e7e9ea;border-radius:8px;padding:6px 8px;font-size:12px;max-width:150px}
     .xdeck-btn{background:#16181c;border:1px solid #333639;color:#e7e9ea;border-radius:8px;padding:7px 11px;font-size:13px;cursor:pointer}
     .xdeck-btn:hover{background:#1d1f23}
     .xdeck-btn.primary{background:#1d9bf0;border-color:#1d9bf0;color:#fff;font-weight:600}
+    .xdeck-btn.small{padding:3px 8px;font-size:11px}
+    .xdeck-btn.active{background:#1d9bf0;border-color:#1d9bf0;color:#fff}
     .xdeck-toggle{display:inline-flex;align-items:center;gap:5px;font-size:12px;color:#8b98a5;cursor:pointer}
     #xdeck-status{font-size:12px;color:#8b98a5;margin-left:auto}
     #xdeck-status.warn{color:#ffd166}
+    #xdeck-main{flex:1 1 auto;display:flex;min-height:0}
+    #xdeck-side{flex:0 0 190px;display:flex;flex-direction:column;gap:4px;padding:10px;border-right:1px solid #2f3336;background:#08090a;overflow-y:auto}
+    .xdeck-side-h{display:flex;align-items:center;gap:6px;font-size:11px;font-weight:700;letter-spacing:.05em;text-transform:uppercase;color:#8b98a5;margin:0 2px 4px}
+    .xdeck-side-h .xdeck-btn{margin-left:auto;text-transform:none;letter-spacing:0;font-weight:600}
+    .xdeck-listrow{display:flex;align-items:center;gap:6px;font-size:13px;color:#e7e9ea;padding:4px 4px;border-radius:6px;cursor:pointer;user-select:none}
+    .xdeck-listrow:hover{background:#131518}
+    .xdeck-listrow input{margin:0;accent-color:#1d9bf0;cursor:pointer}
+    .xdeck-listrow .nm{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    .xdeck-listrow .ct{font-size:11px;color:#5b6571}
+    .xdeck-listrow .del{border:none;background:none;color:#5b6571;font-size:12px;cursor:pointer;padding:0 2px;line-height:1}
+    .xdeck-listrow .del:hover{color:#f4212e}
+    .xdeck-side-empty{font-size:12px;color:#5b6571;padding:4px 2px}
+    .xdeck-newlist{display:flex;gap:4px;margin-top:8px}
+    .xdeck-newlist input{flex:1 1 auto;min-width:0;background:#16181c;border:1px solid #333639;color:#e7e9ea;border-radius:8px;padding:5px 8px;font-size:12px}
     #xdeck-cols{flex:1 1 auto;display:flex;gap:10px;overflow-x:auto;overflow-y:hidden;padding:10px}
     .xdeck-col{flex:0 0 340px;display:flex;flex-direction:column;background:#0a0a0a;border:1px solid #2f3336;border-radius:12px;overflow:hidden;height:100%}
     .xdeck-col.dragover{outline:2px dashed #1d9bf0;outline-offset:-2px}
@@ -356,7 +425,8 @@
     .xdeck-colhead .h{font-weight:700;font-size:14px}
     .xdeck-colhead .sub{font-size:11px;color:#8b98a5}
     .xdeck-colhead .grip{color:#5b6571;font-size:14px;margin-right:2px}
-    .xdeck-colhead .x{margin-left:auto;color:#8b98a5;cursor:pointer;border:none;background:none;font-size:16px;padding:2px 6px}
+    .xdeck-colhead select{background:#16181c;border:1px solid #333639;color:#8b98a5;border-radius:6px;font-size:10px;padding:2px 3px;max-width:96px;margin-left:auto;cursor:pointer}
+    .xdeck-colhead .x{color:#8b98a5;cursor:pointer;border:none;background:none;font-size:16px;padding:2px 6px;flex:0 0 auto}
     .xdeck-colhead .x:hover{color:#f4212e}
     .xdeck-body{flex:1 1 auto;overflow-y:auto;overflow-x:hidden}
     .xdeck-post{padding:11px 12px;border-bottom:1px solid #1c1f22;cursor:pointer}
@@ -397,14 +467,19 @@
   }
 
   let overlay;
+  // Only a deck that is actually in the document counts as open: X can drop the
+  // overlay from the page, leaving us a detached copy that would swallow clicks.
+  const isOpen = () => !!(overlay && overlay.isConnected && overlay.classList.contains('open'));
+
   function buildOverlay() {
     injectStyles();
-    overlay = document.createElement('div');
-    overlay.id = 'xdeck-overlay';
-    overlay.innerHTML = `
+    const el = document.createElement('div');
+    el.id = 'xdeck-overlay';
+    el.innerHTML = `
       <div id="xdeck-bar">
         <h1>X Column Deck</h1>
         <input id="xdeck-add" type="text" placeholder="add @username + Enter">
+        <select id="xdeck-addlist" title="add the new column to this list"></select>
         <button class="xdeck-btn" id="xdeck-addbtn">Add</button>
         <button class="xdeck-btn primary" id="xdeck-refresh">Refresh all</button>
         <label class="xdeck-toggle"><input type="checkbox" id="xdeck-rep"> replies</label>
@@ -417,8 +492,19 @@
         <span id="xdeck-status"></span>
         <button class="xdeck-btn" id="xdeck-close" style="margin-left:8px">✕ close</button>
       </div>
-      <div id="xdeck-cols"></div>`;
-    document.body.appendChild(overlay);
+      <div id="xdeck-main">
+        <div id="xdeck-side">
+          <div class="xdeck-side-h">Lists <button class="xdeck-btn small" id="xdeck-all" title="show every list">All</button></div>
+          <div id="xdeck-listbox"></div>
+          <div class="xdeck-newlist">
+            <input id="xdeck-newlist" type="text" placeholder="new list" maxlength="40">
+            <button class="xdeck-btn small" id="xdeck-newlistbtn" title="create list">＋</button>
+          </div>
+        </div>
+        <div id="xdeck-cols"></div>
+      </div>`;
+    document.body.appendChild(el);
+    overlay = el;
 
     const $ = (id) => overlay.querySelector(id);
     $('#xdeck-rep').checked = prefs.showReplies;
@@ -428,17 +514,66 @@
     const addNow = () => {
       const v = $('#xdeck-add').value.trim().replace(/^@/, '').toLowerCase();
       $('#xdeck-add').value = '';
-      if (v && !users.includes(v)) { users.push(v); store.set(LS.users, users); renderColumns(); refreshOne(v); }
+      if (!v) return;
+      const lid = $('#xdeck-addlist').value;
+      prefs.addList = lid; savePrefs();
+      if (!users.includes(v)) {
+        users.push(v); store.set(LS.users, users);
+        setUserList(v, lid);
+        renderSidebar(); renderColumns(); refreshOne(v);
+      } else {
+        setUserList(v, lid);
+        renderSidebar(); renderColumns();
+      }
     };
     $('#xdeck-addbtn').onclick = addNow;
     $('#xdeck-add').addEventListener('keydown', (e) => { if (e.key === 'Enter') addNow(); });
+    $('#xdeck-addlist').addEventListener('change', (e) => { prefs.addList = e.target.value; savePrefs(); });
     $('#xdeck-refresh').onclick = () => refreshAll();
-    $('#xdeck-close').onclick = () => overlay.classList.remove('open');
-    $('#xdeck-rep').onchange = (e) => { prefs.showReplies = e.target.checked; store.set(LS.prefs, prefs); renderColumns(); };
-    $('#xdeck-rt').onchange = (e) => { prefs.showRetweets = e.target.checked; store.set(LS.prefs, prefs); renderColumns(); };
-    $('#xdeck-auto').onchange = (e) => { prefs.autoMin = +e.target.value; store.set(LS.prefs, prefs); scheduleAuto(); };
+    $('#xdeck-close').onclick = () => closeDeck();
+    $('#xdeck-rep').onchange = (e) => { prefs.showReplies = e.target.checked; savePrefs(); renderColumns(); };
+    $('#xdeck-rt').onchange = (e) => { prefs.showRetweets = e.target.checked; savePrefs(); renderColumns(); };
+    $('#xdeck-auto').onchange = (e) => { prefs.autoMin = +e.target.value; savePrefs(); scheduleAuto(); };
+
+    // sidebar: "All", checkbox toggles, list deletion, new list
+    $('#xdeck-all').onclick = () => {
+      prefs.activeLists = []; savePrefs(); renderSidebar(); renderColumns();
+    };
+    $('#xdeck-listbox').addEventListener('change', (e) => {
+      const cb = e.target.closest('input[data-list]');
+      if (!cb) return;
+      const id = cb.dataset.list;
+      const set = new Set(prefs.activeLists);
+      if (cb.checked) set.add(id); else set.delete(id);
+      prefs.activeLists = [...set]; savePrefs();
+      renderSidebar(); renderColumns();
+    });
+    $('#xdeck-listbox').addEventListener('click', (e) => {
+      const del = e.target.closest('button[data-del]');
+      if (!del) return;
+      e.preventDefault(); e.stopPropagation();
+      deleteList(del.dataset.del);
+      renderSidebar(); renderColumns();
+    });
+    const newList = () => {
+      const inp = $('#xdeck-newlist');
+      const id = createList(inp.value);
+      inp.value = '';
+      if (id) { renderSidebar(); renderColumns(); }
+    };
+    $('#xdeck-newlistbtn').onclick = newList;
+    $('#xdeck-newlist').addEventListener('keydown', (e) => { if (e.key === 'Enter') newList(); });
+
+    // column header list pickers
+    $('#xdeck-cols').addEventListener('change', (e) => {
+      const sel = e.target.closest('select[data-handle]');
+      if (!sel) return;
+      setUserList(sel.dataset.handle, sel.value);
+      renderSidebar(); renderColumns();
+    });
 
     updateStatus();
+    renderSidebar();
     renderColumns();
   }
 
@@ -449,15 +584,52 @@
     else { el.textContent = '⏳ open any X profile once to initialize'; el.classList.add('warn'); }
   }
 
+  // ---- sidebar: the deck's lists + which ones are showing -------------------
+  function renderSidebar() {
+    const box = overlay?.querySelector('#xdeck-listbox');
+    if (!box) return;
+
+    const rows = lists.map((l) => ({ id: l.id, name: l.name, count: users.filter((h) => assign[h] === l.id).length, del: true }));
+    const unsorted = users.filter((h) => !assign[h]).length;
+    if (unsorted) rows.push({ id: UNSORTED, name: 'Unsorted', count: unsorted, del: false });
+
+    if (!rows.length) {
+      box.innerHTML = `<div class="xdeck-side-empty">No lists yet — create one below, then pick it on a column.</div>`;
+    } else {
+      box.innerHTML = rows.map((r) => `
+        <label class="xdeck-listrow">
+          <input type="checkbox" data-list="${esc(r.id)}"${prefs.activeLists.includes(r.id) ? ' checked' : ''}>
+          <span class="nm">${esc(r.name)}</span>
+          <span class="ct">${r.count}</span>
+          ${r.del ? `<button class="del" data-del="${esc(r.id)}" title="delete list">✕</button>` : ''}
+        </label>`).join('');
+    }
+
+    // "All" is active when no particular list is chosen.
+    overlay.querySelector('#xdeck-all').classList.toggle('active', !prefs.activeLists.length);
+
+    // add-to-list picker in the toolbar
+    const addSel = overlay.querySelector('#xdeck-addlist');
+    const wanted = prefs.addList || '';
+    addSel.innerHTML = `<option value="">no list</option>` +
+      lists.map((l) => `<option value="${esc(l.id)}">${esc(l.name)}</option>`).join('');
+    addSel.value = lists.some((l) => l.id === wanted) ? wanted : '';
+  }
+
   // ---- columns + drag reorder ----------------------------------------------
-  let dragIdx = null;
+  let dragHandle = null;
 
   function renderColumns() {
     const wrap = overlay?.querySelector('#xdeck-cols');
     if (!wrap) return;
     wrap.innerHTML = '';
     if (!users.length) { wrap.innerHTML = `<div class="xdeck-empty" style="margin:auto">Add an @username above to create your first column.</div>`; return; }
-    users.forEach((handle, idx) => wrap.appendChild(makeColumn(handle, idx)));
+    const shown = visibleHandles();
+    if (!shown.length) {
+      wrap.innerHTML = `<div class="xdeck-empty" style="margin:auto">No columns in the selected lists. Tick another list, or press All.</div>`;
+      return;
+    }
+    shown.forEach((handle) => wrap.appendChild(makeColumn(handle)));
   }
 
   function mediaHtml(media) {
@@ -544,10 +716,16 @@
     }
   }
 
-  function makeColumn(handle, idx) {
+  function listOptions(handle) {
+    const cur = assign[handle] || '';
+    return `<option value="">— no list —</option>` +
+      lists.map((l) => `<option value="${esc(l.id)}"${l.id === cur ? ' selected' : ''}>${esc(l.name)}</option>`).join('');
+  }
+
+  function makeColumn(handle) {
     const col = document.createElement('div');
     col.className = 'xdeck-col';
-    col.dataset.idx = idx;
+    col.dataset.handle = handle;
 
     if (!view[handle]) view[handle] = [...(cache[handle] || [])]; // seed from persisted page
     const posts = applyFilters(view[handle]);
@@ -563,6 +741,7 @@
           <div class="h" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(name)}</div>
           <div class="sub">@${esc(handle)}</div>
         </div>
+        <select class="xdeck-listpick" data-handle="${esc(handle)}" title="put this column in a list">${listOptions(handle)}</select>
         <button class="x" title="remove">✕</button>
       </div>
       <div class="xdeck-body"></div>`;
@@ -584,20 +763,23 @@
     col.querySelector('.x').onclick = () => {
       users = users.filter((u) => u !== handle); store.set(LS.users, users);
       delete cache[handle]; delete view[handle]; delete cursors[handle]; ended.delete(handle);
-      store.set(LS.cache, cache); renderColumns();
+      setUserList(handle, '');
+      store.set(LS.cache, cache); renderSidebar(); renderColumns();
     };
 
     const head = col.querySelector('.xdeck-colhead');
-    head.addEventListener('dragstart', (e) => { dragIdx = idx; e.dataTransfer.effectAllowed = 'move'; });
+    head.addEventListener('dragstart', (e) => { dragHandle = handle; e.dataTransfer.effectAllowed = 'move'; });
     col.addEventListener('dragover', (e) => { e.preventDefault(); col.classList.add('dragover'); });
     col.addEventListener('dragleave', () => col.classList.remove('dragover'));
     col.addEventListener('drop', (e) => {
       e.preventDefault(); col.classList.remove('dragover');
-      const to = +col.dataset.idx;
-      if (dragIdx === null || dragIdx === to) return;
-      const [moved] = users.splice(dragIdx, 1);
-      users.splice(to, 0, moved);
-      store.set(LS.users, users); dragIdx = null; renderColumns();
+      const to = col.dataset.handle;
+      if (!dragHandle || dragHandle === to) return;
+      const from = users.indexOf(dragHandle); const at = users.indexOf(to);
+      if (from < 0 || at < 0) return;
+      const [moved] = users.splice(from, 1);
+      users.splice(at, 0, moved);
+      store.set(LS.users, users); dragHandle = null; renderColumns();
     });
 
     return col;
@@ -606,7 +788,7 @@
   // ---- refresh -------------------------------------------------------------
   async function refreshOne(handle) {
     if (!isReady()) { updateStatus(); return; }
-    const col = [...(overlay?.querySelectorAll('.xdeck-col') || [])].find((c) => users[+c.dataset.idx] === handle);
+    const col = overlay?.querySelector(`.xdeck-col[data-handle="${handle}"]`);
     col?.classList.add('loading');
     try {
       const { posts, cursor } = await fetchUser(handle);
@@ -620,17 +802,34 @@
   async function refreshAll() {
     updateStatus();
     if (!isReady()) return;
-    for (const h of [...users]) { await refreshOne(h); await new Promise((r) => setTimeout(r, 1200)); }
+    for (const h of visibleHandles()) { await refreshOne(h); await new Promise((r) => setTimeout(r, 1200)); }
   }
 
   let autoTimer = null;
   function scheduleAuto() {
     if (autoTimer) clearInterval(autoTimer);
-    if (prefs.autoMin > 0) autoTimer = setInterval(() => { if (overlay?.classList.contains('open')) refreshAll(); }, prefs.autoMin * 60000);
+    if (prefs.autoMin > 0) autoTimer = setInterval(() => { if (isOpen()) refreshAll(); }, prefs.autoMin * 60000);
   }
 
   // ---- boot ----------------------------------------------------------------
   function markReady() { if (overlay) updateStatus(); }
+
+  // Opening the deck. The overlay is rebuilt whenever X has thrown it away, so
+  // the launcher button can never end up toggling a detached copy of the deck
+  // (which is what made clicking the button look like it did nothing).
+  function ensureOverlay() {
+    if (!overlay || !overlay.isConnected) { overlay = null; buildOverlay(); return overlay; }
+    if (overlay.parentNode !== document.body) document.body.appendChild(overlay);
+    return overlay;
+  }
+  function openDeck() {
+    if (!document.body) return;
+    ensureOverlay();
+    overlay.classList.add('open');
+    updateStatus(); renderSidebar(); renderColumns(); scheduleAuto();
+  }
+  function closeDeck() { if (overlay) overlay.classList.remove('open'); }
+  function toggleDeck() { if (!document.body) return; isOpen() ? closeDeck() : openDeck(); }
 
   function addFab() {
     if (document.getElementById('xdeck-fab')) return;
@@ -638,12 +837,10 @@
     injectStyles();
     const fab = document.createElement('button');
     fab.id = 'xdeck-fab';
+    fab.type = 'button';
     fab.textContent = '▦ Deck';
-    fab.onclick = () => {
-      if (!overlay) buildOverlay();
-      overlay.classList.toggle('open');
-      if (overlay.classList.contains('open')) { updateStatus(); scheduleAuto(); }
-    };
+    fab.title = 'Open X Column Deck';
+    fab.onclick = toggleDeck;
     document.body.appendChild(fab);
     console.log('[X Column Deck] button added');
   }
@@ -652,5 +849,18 @@
   function boot() { if (document.body) addFab(); }
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
   else boot();
-  setInterval(addFab, 2000); // self-heal if X ever removes it
+  setInterval(() => {
+    addFab();
+    // Re-attach an open deck if X wiped it out of the document.
+    if (overlay && !overlay.isConnected && overlay.classList.contains('open') && document.body) {
+      document.body.appendChild(overlay);
+    }
+  }, 2000); // self-heal if X ever removes it
+
+  document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && isOpen()) closeDeck(); }, true);
+
+  // Also openable from Tampermonkey's own menu.
+  try {
+    if (typeof GM_registerMenuCommand === 'function') GM_registerMenuCommand('Open X Column Deck', openDeck);
+  } catch {}
 })();
