@@ -59,6 +59,9 @@ Notes on the first run and permissions:
   filed under a ticked list are shown; **All** clears the ticks and shows every
   column. Columns with no list sit in **Unsorted** and stay hidden while a list
   filter is active.
+- **Hide the sidebar**: the ‹ button in the sidebar header collapses it to a thin
+  rail and gives the columns the full width; › brings it back. The deck remembers
+  which state you left it in. The list filter stays applied either way.
 - **Re-file a column**: use the small dropdown in the column header.
 - **Reorder columns**: drag a column by its header. **Remove**: the ✕ in the header.
 - **Refresh**: *Refresh all* reloads the visible columns (X is rate limited, so it

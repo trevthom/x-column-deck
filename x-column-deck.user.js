@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         X Column Deck — multi-user reader
 // @namespace    https://local/x-column-deck
-// @version      1.6.0
-// @description  TweetDeck-style columns of selected X users' posts & replies, grouped into your own lists (separate from X's lists) and filtered from a sidebar. Inline media + quoted posts, newest on top, capped at 20, click to open the thread, drag to reorder columns. Rides your logged-in session. CSP-safe sandbox build.
+// @version      1.7.0
+// @description  TweetDeck-style columns of selected X users' posts & replies, grouped into your own lists (separate from X's lists) and filtered from a collapsible sidebar. Inline media + quoted posts, newest on top, capped at 20, click to open the thread, drag to reorder columns. Rides your logged-in session. CSP-safe sandbox build.
 // @author       you
 // @match        https://x.com/*
 // @match        https://twitter.com/*
@@ -35,13 +35,15 @@
    *   learned anything and Refresh did nothing), replays the same method it
    *   saw, and can also learn the current query IDs straight from X's own
    *   loaded client bundle, so the deck comes up without a profile visit.
+   *   v1.7 lets the list sidebar collapse to a thin rail (the choice is
+   *   remembered in prefs), so the columns can use the full width.
    * ========================================================================= */
 
   // The real page window (sandbox shares the same `document`, but globals like
   // fetch / XMLHttpRequest live on the page window -> unsafeWindow).
   const W = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
 
-  console.log('[X Column Deck] v1.6 loaded on', location.host);
+  console.log('[X Column Deck] v1.7 loaded on', location.host);
 
   // ---- storage (GM with localStorage fallback) -----------------------------
   const GM_OK = (typeof GM_setValue === 'function' && typeof GM_getValue === 'function');
@@ -63,7 +65,7 @@
   let users    = store.get(LS.users, []);
   let captured = store.get(LS.cap, { apiBase: '', headers: {}, byScreenName: null, userTweets: null });
   let cache    = store.get(LS.cache, {});
-  let prefs    = store.get(LS.prefs, { showReplies: true, showRetweets: true, autoMin: 0, activeLists: [], addList: '' });
+  let prefs    = store.get(LS.prefs, { showReplies: true, showRetweets: true, autoMin: 0, activeLists: [], addList: '', sideCollapsed: false });
   let profiles = store.get(LS.profiles, {}); // handle -> { id, name, screen, avatar }
 
   // The deck's OWN lists. Not X.com lists — these never touch your account.
@@ -72,6 +74,7 @@
   const UNSORTED = '__none__';
   prefs.activeLists = Array.isArray(prefs.activeLists) ? prefs.activeLists : [];
   if (typeof prefs.addList !== 'string') prefs.addList = '';
+  prefs.sideCollapsed = !!prefs.sideCollapsed;
 
   // session-only pagination state (cache persists just the most-recent page)
   const cursors = {};       // handle -> bottom cursor for the next page
@@ -557,9 +560,18 @@
     #xdeck-status{font-size:12px;color:#8b98a5;margin-left:auto}
     #xdeck-status.warn{color:#ffd166}
     #xdeck-main{flex:1 1 auto;display:flex;min-height:0}
-    #xdeck-side{flex:0 0 190px;display:flex;flex-direction:column;gap:4px;padding:10px;border-right:1px solid #2f3336;background:#08090a;overflow-y:auto}
+    #xdeck-side{flex:0 0 190px;display:flex;flex-direction:column;gap:4px;padding:10px;border-right:1px solid #2f3336;background:#08090a;overflow-y:auto;transition:flex-basis .15s ease}
     .xdeck-side-h{display:flex;align-items:center;gap:6px;font-size:11px;font-weight:700;letter-spacing:.05em;text-transform:uppercase;color:#8b98a5;margin:0 2px 4px}
-    .xdeck-side-h .xdeck-btn{margin-left:auto;text-transform:none;letter-spacing:0;font-weight:600}
+    .xdeck-side-h .xdeck-side-title{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    .xdeck-side-h .xdeck-btn{text-transform:none;letter-spacing:0;font-weight:600}
+    .xdeck-side-h #xdeck-side-toggle{padding:3px 6px;font-size:11px;line-height:1}
+    /* collapsed: a thin rail with just the reopen button */
+    #xdeck-side.collapsed{flex:0 0 36px;padding:10px 5px;overflow:hidden}
+    #xdeck-side.collapsed .xdeck-side-h{justify-content:center;margin:0}
+    #xdeck-side.collapsed .xdeck-side-title,
+    #xdeck-side.collapsed #xdeck-all,
+    #xdeck-side.collapsed #xdeck-listbox,
+    #xdeck-side.collapsed .xdeck-newlist{display:none}
     .xdeck-listrow{display:flex;align-items:center;gap:6px;font-size:13px;color:#e7e9ea;padding:4px 4px;border-radius:6px;cursor:pointer;user-select:none}
     .xdeck-listrow:hover{background:#131518}
     .xdeck-listrow input{margin:0;accent-color:#1d9bf0;cursor:pointer}
@@ -649,7 +661,11 @@
       </div>
       <div id="xdeck-main">
         <div id="xdeck-side">
-          <div class="xdeck-side-h">Lists <button class="xdeck-btn small" id="xdeck-all" title="show every list">All</button></div>
+          <div class="xdeck-side-h">
+            <span class="xdeck-side-title">Lists</span>
+            <button class="xdeck-btn small" id="xdeck-all" title="show every list">All</button>
+            <button class="xdeck-btn small" id="xdeck-side-toggle" title="collapse the list sidebar" aria-expanded="true">‹</button>
+          </div>
           <div id="xdeck-listbox"></div>
           <div class="xdeck-newlist">
             <input id="xdeck-newlist" type="text" placeholder="new list" maxlength="40">
@@ -698,6 +714,20 @@
     $('#xdeck-all').onclick = () => {
       prefs.activeLists = []; savePrefs(); renderSidebar(); renderColumns();
     };
+    // collapse / expand the list sidebar; remembered between sessions
+    const setSide = (collapsed) => {
+      const side = $('#xdeck-side');
+      const btn = $('#xdeck-side-toggle');
+      side.classList.toggle('collapsed', collapsed);
+      btn.textContent = collapsed ? '›' : '‹';
+      btn.title = collapsed ? 'show the list sidebar' : 'collapse the list sidebar';
+      btn.setAttribute('aria-expanded', String(!collapsed));
+    };
+    $('#xdeck-side-toggle').onclick = () => {
+      prefs.sideCollapsed = !prefs.sideCollapsed; savePrefs();
+      setSide(prefs.sideCollapsed);
+    };
+    setSide(prefs.sideCollapsed);
     $('#xdeck-listbox').addEventListener('change', (e) => {
       const cb = e.target.closest('input[data-list]');
       if (!cb) return;
